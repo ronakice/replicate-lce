@@ -24,13 +24,13 @@ def run_single_fold(args, config):
         logger.info(f"TASK: {args.config_path}")
         logger.info(f"TRAINING ON FOLD {fold}")
         preds, scores = task.train()
-        scores = scores["fold_dev_metrics"]
 
     if args.eval:
         logger.info(f"TASK: {args.config_path}\tEVALUATING ON FOLD {fold}")
-        task.predict_on_dev()
-        scores = task.evaluate_on_dev()
+        task.predict()
+        scores = task.evaluate()
 
+    scores = scores["fold_dev_metrics"]
     logger.info(f"dev metrics on fold {fold}: ")
     logger.info(scores)
 

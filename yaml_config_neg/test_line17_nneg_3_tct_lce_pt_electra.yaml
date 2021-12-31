@@ -1,0 +1,46 @@
+'fold': 's1'
+'threshold': '1000'
+'testthreshold': '10'
+'optimize': 'MRR@10'
+'rank':
+  'optimize': 'MRR@10'
+  'searcher':
+    'name': 'msptop200'
+    'firststage': 'tct'
+    
+'sampler':
+  'name': 'LCEtriplet'
+  'nneg': '3'
+
+'benchmark':
+  'name': 'msmarcopsg'
+
+'reranker':
+  'name': 'ptBERTMaxP'
+  'pretrained': 'google/electra-base-discriminator'
+  'trainer':
+    'name': 'LCEpt'
+    'seed': '42'
+    'niters': '10'
+    'itersize': '48000'
+    'batch': '16'
+    'evalbatch': '256'
+    'decaytype': 'linear'
+    'decay': '0.1'
+    'decayiters': '10'
+    'warmupiters': '1'
+    'amp': 'both'
+    'validatefreq': '10'
+    'lr': '1e-5'
+    'multithread' : 'True'
+    'nneg' : '3'
+
+  'extractor': 
+    'name': 'LCEbertpassage'
+    'nneg': '3'
+    'maxqlen': '50'
+    'maxseqlen': '256'
+    'numpassages': '1'
+    'usecache': 'True'
+    'tokenizer':
+      'pretrained': 'google/electra-base-discriminator'
