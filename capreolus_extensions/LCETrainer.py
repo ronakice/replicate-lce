@@ -7,6 +7,7 @@ from torch import nn
 import numpy as np
 import contextlib
 import os 
+import time
 
 sys.path.append('../')
 
@@ -14,11 +15,14 @@ from capreolus.trainer import Trainer
 from capreolus.trainer.tensorflow import TensorflowTrainer
 from capreolus.trainer.pytorch import PytorchTrainer
 from capreolus_extensions.LCEReranker_and_Loss import KerasLCEModel, TFLCELoss
-from capreolus import ConfigOption
 from capreolus.reranker.common import pair_hinge_loss, pair_softmax_loss
-from capreolus import ConfigOption, get_logger
-from capreolus import Searcher
+from capreolus import ConfigOption, Searcher, constants, get_logger
+from capreolus.utils.trec import convert_metric
+from capreolus.evaluator import log_metrics_verbose, format_metrics_string
 
+from torch.utils.tensorboard import SummaryWriter
+
+RESULTS_BASE_PATH = constants["RESULTS_BASE_PATH"]
 logger = get_logger(__name__) 
 
 @Trainer.register
@@ -105,7 +109,7 @@ class LCEptTrainer(PytorchTrainer):
 
         """
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.loss = self.lce_loss
 
         iter_loss = []
@@ -156,6 +160,116 @@ class LCEptTrainer(PytorchTrainer):
                 break
 
         return torch.stack(iter_loss).mean()
+
+
+    def train(self, reranker, train_dataset, train_output_path, dev_data, dev_output_path, qrels, metric, benchmark):
+        """Train a model following the trainer's config (specifying batch size, number of iterations, etc).
+
+        Args:
+           train_dataset (IterableDataset): training dataset
+           train_output_path (Path): directory under which train_dataset runs and training loss will be saved
+           dev_data (IterableDataset): dev dataset
+           dev_output_path (Path): directory where dev_data runs and metrics will be saved
+
+        """
+        # Set up logging
+        # TODO why not put this under train_output_path?
+        summary_writer = SummaryWriter(RESULTS_BASE_PATH / "runs" / self.config["boardname"], comment=train_output_path)
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        reranker.model = torch.nn.DataParallel(reranker.model, device_ids=range(torch.cuda.device_count()))
+        reranker.model.to(self.device)
+        self.optimizer = torch.optim.Adam(filter(lambda param: param.requires_grad, reranker.model.parameters()), lr=self.config["lr"])
+
+        if self.config["amp"] in ("both", "train"):
+            self.amp_train_autocast = torch.cuda.amp.autocast
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.amp_train_autocast = contextlib.nullcontext
+            self.scaler = None
+
+        # REF-TODO how to handle interactions between fastforward and schedule? --> just save its state
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lambda epoch: self.lr_multiplier(step=epoch * self.n_batch_per_iter)
+        )
+
+        dev_best_weight_fn, weights_output_path, info_output_path, loss_fn, metric_fn = self.get_paths_for_early_stopping(
+            train_output_path, dev_output_path
+        )
+
+        num_workers = 1 if self.config["multithread"] else 0
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=self.config["batch"], pin_memory=True, num_workers=num_workers
+        )
+
+        # if we're fastforwarding, set first iteration and load last saved weights
+        initial_iter, metrics = (
+            self.fastforward_training(reranker, weights_output_path, loss_fn, metric_fn)
+            if self.config["fastforward"]
+            else (0, {})
+        )
+        dev_best_metric = metrics.get(metric, -np.inf)
+        logger.info("starting training from iteration %s/%s", initial_iter + 1, self.config["niters"])
+        logger.info(f"Best metric loaded: {metric}={dev_best_metric}")
+
+        train_loss = []
+        # are we resuming training? fastforward loss and data if so
+        if initial_iter > 0:
+            train_loss = self.load_loss_file(loss_fn)
+
+            # are we done training? if not, fastforward through prior batches
+            if initial_iter < self.config["niters"]:
+                logger.debug("fastforwarding train_dataloader to iteration %s", initial_iter)
+                self.exhaust_used_train_data(train_dataloader, n_batch_to_exhaust=initial_iter * self.n_batch_per_iter)
+
+        logger.info(self.get_validation_schedule_msg(initial_iter))
+        train_start_time = time.time()
+        for niter in range(initial_iter, self.config["niters"]):
+            niter = niter + 1  # index from 1
+            reranker.model.train()
+
+            iter_start_time = time.time()
+            iter_loss_tensor = self.single_train_iteration(reranker, train_dataloader)
+            logger.info("A single iteration takes {}".format(time.time() - iter_start_time))
+            train_loss.append(iter_loss_tensor.item())
+            logger.info("iter = %d loss = %f", niter, train_loss[-1])
+
+            # save model weights only when fastforward enabled
+            if self.config["fastforward"]:
+                weights_fn = weights_output_path / f"{niter}.p"
+                reranker.save_weights(weights_fn, self.optimizer)
+
+            # predict performance on dev set
+            if niter % self.config["validatefreq"] == 0:
+                pred_fn = dev_output_path / f"{niter}.run"
+                preds = self.predict(reranker, dev_data, pred_fn)
+
+                # log dev metrics
+                metrics = benchmark.evaluate(preds, qrels)
+                logger.info("dev metrics: %s", format_metrics_string(metrics))
+                for metric_str in ["AP", "P@20", "NDCG@20"]:
+                    metric = convert_metric(metric_str)
+                    summary_writer.add_scalar(metric_str, metrics[metric], niter)
+
+                # write best dev weights to file
+                if metrics[metric] > dev_best_metric:
+                    dev_best_metric = metrics[metric]
+                    logger.info("new best dev metric: %0.4f", dev_best_metric)
+                    reranker.save_weights(dev_best_weight_fn, self.optimizer)
+                    self.write_to_metric_file(metric_fn, metrics)
+
+            # write train_loss to file
+            self.write_to_loss_file(loss_fn, train_loss)
+
+            summary_writer.add_scalar("training_loss", iter_loss_tensor.item(), niter)
+            reranker.add_summary(summary_writer, niter)
+            summary_writer.flush()
+        logger.info("training loss: %s", train_loss)
+        logger.info("Training took {}".format(time.time() - train_start_time))
+        summary_writer.close()
+
+        # TODO should we write a /done so that training can be skipped if possible when fastforward=False? or in Task?
+
     def predict(self, reranker, pred_data, pred_fn):
         """Predict query-document scores on `pred_data` using `model` and write a corresponding run file to `pred_fn`
 
@@ -174,11 +288,10 @@ class LCEptTrainer(PytorchTrainer):
         else:
             self.amp_pred_autocast = contextlib.nullcontext
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         # save to pred_fn
 
-        model = torch.nn.DataParallel(reranker.model).to(self.device)
-        model.eval()
+        reranker.model.eval()
 
         preds = {}
         evalbatch = self.config["evalbatch"] if self.config["evalbatch"] > 0 else self.config["batch"]
